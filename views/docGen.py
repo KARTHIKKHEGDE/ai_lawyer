@@ -1,6 +1,11 @@
 import os
 import re
 from docx import Document as DocxDocument
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 templates = {
     "bail_application": """\
@@ -155,9 +160,70 @@ Witness 2: ________________  Date: __________
 """
 }
 
+def extract_details_with_ai(prompt, document_type):
+    """
+    Use AI to extract specific details from user prompt for document generation.
+    """
+    extraction_prompt = f"""
+    Extract specific details from this user request for a {document_type}:
+    "{prompt}"
+    
+    Return ONLY a JSON object with the following fields (use "NOT_PROVIDED" if not mentioned):
+    {{
+        "applicant_name": "person's name who needs bail",
+        "offense": "what crime/charge",
+        "section": "IPC section number",
+        "court_name": "which court",
+        "case_number": "case number if mentioned",
+        "date_of_incident": "when did the incident happen",
+        "lawyer_name": "lawyer's name",
+        "your_name": "who is applying (if different from lawyer)",
+        "relationship": "relationship to applicant",
+        "additional_details": "any other specific details mentioned"
+    }}
+    
+    Example: If user says "bail application for John charged with theft under section 379"
+    Return: {{"applicant_name": "John", "offense": "theft", "section": "379", "court_name": "NOT_PROVIDED", ...}}
+    """
+    
+    try:
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(extraction_prompt)
+        import json
+        extracted_data = json.loads(response.text.strip())
+        return extracted_data
+    except Exception as e:
+        print(f"AI extraction failed: {e}")
+        return {}
+def get_document_requirements(doc_type):
+    """
+    Returns what information is needed for each document type.
+    """
+    requirements = {
+        "bail_application": [
+            "📝 Required: Applicant's full name",
+            "⚖️ Required: Type of offense/charge",
+            "📖 Required: IPC section number", 
+            "🏛️ Required: Court name (e.g., 'Delhi District Court')",
+            "📋 Optional: Case number",
+            "👤 Optional: Lawyer/applicant name",
+            "📅 Optional: Date of incident",
+            "\n💡 Example: 'bail application for John Doe charged with theft under section 379 at Delhi District Court case number CR-123/2024 by lawyer Priya Sharma'"
+        ],
+        "lease_agreement": [
+            "🏠 Required: Property address",
+            "👤 Required: Landlord name", 
+            "👤 Required: Tenant name",
+            "💰 Required: Monthly rent amount",
+            "📅 Required: Lease start/end dates"
+        ]
+    }
+    return requirements.get(doc_type, ["Please provide specific details for the document."])
+
 def generate_legal_document(prompt, save_dir='static/generated_docs'):
     """
     Generates a legal document Word file based on the given prompt.
+    Now uses AI to extract specific details from user input.
     
     Args:
         prompt (str): User input specifying type and details.
@@ -173,53 +239,70 @@ def generate_legal_document(prompt, save_dir='static/generated_docs'):
     prompt_lower = prompt.lower()
     file_name = ""
     template = ""
-    data = {}
-
-    if "bail application" in prompt_lower:
+    
+    # Determine document type
+    if any(word in prompt_lower for word in ["bail", "bail application"]):
         template = templates["bail_application"]
         file_name = "bail_application.docx"
-
-        applicant_name = re.search(r"(?<=for )[\w\s]+", prompt, re.IGNORECASE)
-        applicant_name = applicant_name.group(0).strip() if applicant_name else "Default Applicant"
-
-        data = {
-            "COURT NAME": "District Court of New Delhi",
-            "COURT ADDRESS": "123 Court St, New Delhi",
-            "APPLICANT NAME": applicant_name,
-            "YOUR NAME": "Raj Singh",
-            "relation to applicant, e.g., family member, friend, legal counsel": "legal counsel",
-            "OFFENSE": "Theft",
-            "SECTION": "379",
-            "DATE OF INCIDENT": "October 1, 2023",
-            "CASE NUMBER": "A1234",
-            "DATE": "November 2, 2023",
-            "YOUR ADDRESS": "45 Elm St, New Delhi",
-            "YOUR CONTACT": "+91-1234567890"
-        }
-
-    # Example for another type (you would complete similarly for other templates)
-    elif "lease agreement" in prompt_lower:
+        doc_type = "bail_application"
+        
+    elif any(word in prompt_lower for word in ["lease", "lease agreement", "rental"]):
         template = templates["lease_agreement"]
         file_name = "lease_agreement.docx"
-        # Populate data dict here (similar to above)
-
-    elif "cease and desist" in prompt_lower:
+        doc_type = "lease_agreement"
+        
+    elif any(word in prompt_lower for word in ["cease", "cease and desist", "copyright"]):
         template = templates["cease_and_desist"]
         file_name = "cease_and_desist.docx"
-        # Populate data dict here
-
-    elif "power of attorney" in prompt_lower:
+        doc_type = "cease_and_desist"
+        
+    elif any(word in prompt_lower for word in ["power of attorney", "poa"]):
         template = templates["power_of_attorney"]
         file_name = "power_of_attorney.docx"
-        # Populate data dict here
-
+        doc_type = "power_of_attorney"
     else:
-        raise ValueError("Unsupported document type. Please specify a valid document type in your prompt.")
+        # If no specific type detected, provide requirements guide
+        if any(word in prompt_lower for word in ["help", "what", "how", "requirements"]):
+            requirements_text = "\n".join([
+                "📋 **Document Generation Requirements:**\n",
+                "🎯 **Bail Application:**",
+                *get_document_requirements("bail_application"),
+                "\n🎯 **Other Documents:** lease agreement, cease and desist, power of attorney"
+            ])
+            raise ValueError(requirements_text)
+        elif len(prompt.strip()) < 10:
+            raise ValueError(f"Please provide more details.\n\n{chr(10).join(get_document_requirements('bail_application'))}")
+        else:
+            raise ValueError("Unsupported document type. Supported: bail application, lease agreement, cease and desist, power of attorney.\n\nType 'help' for requirements.")
+
+    # Extract details using AI
+    extracted_data = extract_details_with_ai(prompt, doc_type)
+    
+    # Build data dictionary with extracted info or defaults
+    if doc_type == "bail_application":
+        data = {
+            "COURT NAME": extracted_data.get("court_name") if extracted_data.get("court_name") != "NOT_PROVIDED" else "[COURT NAME - Please specify]",
+            "COURT ADDRESS": "[COURT ADDRESS - Please specify]",
+            "APPLICANT NAME": extracted_data.get("applicant_name") if extracted_data.get("applicant_name") != "NOT_PROVIDED" else "[APPLICANT NAME - Please specify]",
+            "YOUR NAME": extracted_data.get("lawyer_name", extracted_data.get("your_name")) if extracted_data.get("lawyer_name") != "NOT_PROVIDED" else "[YOUR NAME - Please specify]",
+            "relation to applicant, e.g., family member, friend, legal counsel": extracted_data.get("relationship") if extracted_data.get("relationship") != "NOT_PROVIDED" else "legal counsel",
+            "OFFENSE": extracted_data.get("offense") if extracted_data.get("offense") != "NOT_PROVIDED" else "[OFFENSE - Please specify]",
+            "SECTION": extracted_data.get("section") if extracted_data.get("section") != "NOT_PROVIDED" else "[IPC SECTION - Please specify]",
+            "DATE OF INCIDENT": extracted_data.get("date_of_incident") if extracted_data.get("date_of_incident") != "NOT_PROVIDED" else "[DATE OF INCIDENT - Please specify]",
+            "CASE NUMBER": extracted_data.get("case_number") if extracted_data.get("case_number") != "NOT_PROVIDED" else "[CASE NUMBER - Please specify]",
+            "DATE": "[TODAY'S DATE - Please specify]",
+            "YOUR ADDRESS": "[YOUR ADDRESS - Please specify]",
+            "YOUR CONTACT": "[YOUR CONTACT - Please specify]"
+        }
+    
+    # Add handling for other document types here...
+    else:
+        data = {}  # Will be filled for other document types
 
     # Fill in template
     document_content = template
     for key, value in data.items():
-        document_content = document_content.replace(f"[{key}]", value)
+        document_content = document_content.replace(f"[{key}]", str(value))
 
     # Create document
     doc = DocxDocument()
