@@ -1,11 +1,13 @@
 import json
 import os
 import re
+import time
 from dotenv import load_dotenv
 import redis
 
 # Gemini SDK
 import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted
 
 # HuggingFace + FAISS
 from langchain_community.vectorstores import FAISS
@@ -213,17 +215,37 @@ def _is_blocked_or_empty(resp) -> bool:
     return True
 
 
-def gemini_generate(prompt: str) -> str:
-    resp = _gemini_generate_once(prompt, temperature=0.2)
-    if not _is_blocked_or_empty(resp):
-        return _extract_text(resp)
+def gemini_generate(prompt: str, max_retries: int = 5) -> str:
+    """Generate content with automatic retry on rate limit errors."""
+    
+    def _try_generate(p: str, temp: float) -> str:
+        for attempt in range(max_retries):
+            try:
+                resp = _gemini_generate_once(p, temperature=temp)
+                if not _is_blocked_or_empty(resp):
+                    return _extract_text(resp)
+                return None  # Blocked/empty, try softened prompt
+            except ResourceExhausted as e:
+                wait_time = min(2 ** attempt * 10, 60)  # 10s, 20s, 40s, 60s max
+                print(f"⚠️ Rate limit hit. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait_time)
+                if attempt == max_retries - 1:
+                    raise e
+        return None
+    
+    # First attempt with original prompt
+    result = _try_generate(prompt, 0.2)
+    if result:
+        return result
+    
+    # Retry with softened prompt
     softened = (
         "Provide a neutral, educational legal summary focused on definitions, elements, and general principles. "
         "Avoid procedural or advisory directives. Keep the tone academic and concise.\n\n"
         + prompt
     )
-    resp_retry = _gemini_generate_once(softened, temperature=0.1)
-    return _extract_text(resp_retry) or "Unable to generate content at this time."
+    result = _try_generate(softened, 0.1)
+    return result or "Unable to generate content at this time."
 
 
 # ---------------- Main Processing ----------------
